@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CVAT annotation viewer</title>
+<style>
+  body { margin: 0; background: #181a1e; color: #eee; font: 14px system-ui, sans-serif; }
+  header { padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button, select { padding: 6px; font: inherit; }
+  select { max-width: min(550px, 90vw); }
+  label { display: inline-flex; align-items: center; gap: 5px; }
+  #legend { display: flex; flex-wrap: wrap; gap: 16px; padding: 0 16px 12px; }
+  #status { margin: 0 16px 12px; }
+  canvas { display: block; margin: auto; max-width: 100%; }
+</style>
+<header>
+  <strong>CVAT viewer</strong>
+  <button id="previous" disabled>← Previous</button>
+  <select id="images" aria-label="Image"></select>
+  <button id="next" disabled>Next →</button>
+  <label><input id="overlay" type="checkbox" checked>Annotations</label>
+  <label><input id="labels" type="checkbox" checked>Labels</label>
+  <label>Fill <input id="opacity" type="range" min="0" max="0.6" step="0.05" value="0.2"></label>
+</header>
+<div id="legend"></div>
+<p id="status" role="status">Loading…</p>
+<canvas id="canvas"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const select = document.getElementById('images');
+const status = document.getElementById('status');
+const previous = document.getElementById('previous');
+const next = document.getElementById('next');
+const overlay = document.getElementById('overlay');
+const labels = document.getElementById('labels');
+const opacity = document.getElementById('opacity');
+const colors = ['#ff657a', '#50db93', '#58bfff', '#ffd166', '#cc99ff', '#ff9955', '#5de3df', '#ef99cf'];
+let data, photo, current = 0, request = 0;
+const categories = new Map();
+const annotations = new Map();
+
+/** Draw the loaded image and selected overlays. Parameters: none. Returns: void. */
+function draw() {
+  if (!photo) return;
+  const scale = Math.min(window.innerWidth / photo.naturalWidth,
+    Math.max(250, window.innerHeight - 150) / photo.naturalHeight, 1);
+  canvas.width = Math.round(photo.naturalWidth * scale);
+  canvas.height = Math.round(photo.naturalHeight * scale);
+  ctx.drawImage(photo, 0, 0, canvas.width, canvas.height);
+  if (!overlay.checked) return;
+  const image = data.images[current];
+  const sx = canvas.width / image.width;
+  const sy = canvas.height / image.height;
+  for (const annotation of annotations.get(image.id) || []) {
+    const category = categories.get(annotation.category_id);
+    const color = category?.color || '#ffffff';
+    const polygons = Array.isArray(annotation.segmentation) ? annotation.segmentation : [];
+    ctx.beginPath();
+    for (const points of polygons) {
+      if (points.length < 6) continue;
+      ctx.moveTo(points[0] * sx, points[1] * sy);
+      for (let i = 2; i < points.length; i += 2) ctx.lineTo(points[i] * sx, points[i + 1] * sy);
+      ctx.closePath();
+    }
+    if (!polygons.length && annotation.bbox) {
+      const [x, y, w, h] = annotation.bbox;
+      ctx.rect(x * sx, y * sy, w * sx, h * sy);
+    }
+    ctx.fillStyle = color;
+    ctx.globalAlpha = Number(opacity.value);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    const anchor = polygons[0] || annotation.bbox;
+    if (labels.checked && anchor) {
+      ctx.font = '12px system-ui';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#181a1e';
+      const name = category?.name || String(annotation.category_id);
+      ctx.strokeText(name, anchor[0] * sx, Math.max(12, anchor[1] * sy - 4));
+      ctx.fillText(name, anchor[0] * sx, Math.max(12, anchor[1] * sy - 4));
+    }
+  }
+}
+
+/** Load an image by index. @param {number} index Image index. @returns {void} */
+function show(index) {
+  if (!data.images.length) return;
+  current = Math.max(0, Math.min(index, data.images.length - 1));
+  const token = ++request;
+  const image = data.images[current];
+  select.value = current;
+  previous.disabled = current === 0;
+  next.disabled = current === data.images.length - 1;
+  photo = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!image.viewer_path) {
+    status.textContent = `Image missing or filename ambiguous: ${image.file_name}`;
+    return;
+  }
+  status.textContent = `Loading ${image.file_name}…`;
+  const loaded = new Image();
+  loaded.onload = () => {
+    if (token !== request) return;
+    photo = loaded;
+    status.textContent = `${current + 1} / ${data.images.length} · ${(annotations.get(image.id) || []).length} annotations · ${image.file_name}`;
+    draw();
+  };
+  loaded.onerror = () => {
+    if (token === request) status.textContent = `Cannot load image: ${image.file_name}`;
+  };
+  loaded.src = '/' + image.viewer_path.split('/').map(encodeURIComponent).join('/');
+}
+
+previous.onclick = () => show(current - 1);
+next.onclick = () => show(current + 1);
+select.onchange = () => show(Number(select.value));
+overlay.onchange = labels.onchange = opacity.oninput = draw;
+window.addEventListener('resize', draw);
+window.addEventListener('keydown', event => {
+  if (event.target.matches('input, select, button') || !data) return;
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    event.preventDefault();
+    show(current + (event.key === 'ArrowRight' ? 1 : -1));
+  }
+});
+fetch('/annotations.json').then(response => {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}).then(result => {
+  data = result;
+  data.categories.forEach((category, index) => {
+    category.color = colors[index % colors.length];
+    categories.set(category.id, category);
+    const item = document.createElement('span');
+    item.textContent = '● ' + category.name;
+    item.style.color = category.color;
+    document.getElementById('legend').append(item);
+  });
+  for (const annotation of data.annotations) {
+    if (!annotations.has(annotation.image_id)) annotations.set(annotation.image_id, []);
+    annotations.get(annotation.image_id).push(annotation);
+  }
+  data.images.forEach((image, index) => select.add(new Option(image.file_name, index)));
+  if (data.images.length) show(0);
+  else status.textContent = 'No images in this annotation file.';
+}).catch(error => { status.textContent = `Cannot load annotations: ${error.message}`; });
+</script>
+</html>
